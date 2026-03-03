@@ -1,0 +1,961 @@
+package com.one211.xds;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.dataformat.yaml.YAMLFactory;
+import com.one211.xds.config.XdsConfig;
+import java.util.concurrent.atomic.AtomicLong;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.attribute.FileTime;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.stream.Collectors;
+import io.envoyproxy.controlplane.cache.v3.Snapshot;
+import io.envoyproxy.envoy.config.cluster.v3.Cluster;
+import io.envoyproxy.envoy.config.core.v3.*;
+import io.envoyproxy.envoy.config.endpoint.v3.*;
+import io.envoyproxy.envoy.config.listener.v3.*;
+import io.envoyproxy.envoy.config.route.v3.*;
+import io.envoyproxy.envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager;
+import io.envoyproxy.envoy.type.v3.*;
+import com.google.protobuf.Duration;
+import io.envoyproxy.envoy.type.matcher.v3.StringMatcher;
+import com.google.protobuf.Any;
+import io.envoyproxy.envoy.extensions.filters.network.http_connection_manager.v3.HttpFilter;
+
+import org.slf4j.Logger;
+
+import java.io.File;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.attribute.FileTime;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
+
+/**
+ * Manages xDS configuration generation and updates
+ */
+public class XdsConfigManager {
+
+    private static final Logger logger = org.slf4j.LoggerFactory.getLogger(XdsConfigManager.class);
+    private static final String VERSION = "1.0.0";
+
+    private static final AtomicLong snapshotVersionCounter = new AtomicLong(0);
+
+    private final ObjectMapper yamlMapper;
+    private final ObjectMapper jsonMapper;
+    private final Map<String, FileTime> fileTimestamps;
+    private final Map<String, List<EndpointConfig>> dynamicEndpoints;
+
+    public XdsConfigManager() {
+        this.yamlMapper = new ObjectMapper(new YAMLFactory());
+        this.jsonMapper = new ObjectMapper();
+        this.fileTimestamps = new ConcurrentHashMap<>();
+        this.dynamicEndpoints = new ConcurrentHashMap<>();
+    }
+
+    /**
+     * Generates the initial xDS snapshot with all resources
+     * Uses dynamic snapshot version for proper configuration updates
+     */
+    public io.envoyproxy.controlplane.cache.v3.Snapshot generateInitialSnapshot() {
+        try {
+            List<Listener> listeners = generateListeners();
+            List<RouteConfiguration> routes = generateRoutes();
+            List<Cluster> clusters = generateClusters();
+            List<ClusterLoadAssignment> endpoints = generateEndpoints();
+
+            // Increment snapshot version on each generation
+            snapshotVersionCounter.incrementAndGet();
+            String currentVersion = VERSION + "-v" + snapshotVersionCounter.get();
+
+            return io.envoyproxy.controlplane.cache.v3.Snapshot.create(
+                    clusters,
+                    endpoints,
+                    listeners,
+                    routes,
+                    Collections.emptyList(),
+                    currentVersion
+            );
+        } catch (Exception e) {
+            logger.error("Failed to generate initial snapshot", e);
+            throw new RuntimeException("Failed to generate initial snapshot", e);
+        }
+    }
+
+    /**
+     * Generates all listeners for the configuration
+     */
+    private List<Listener> generateListeners() {
+        List<Listener> listeners = new ArrayList<>();
+
+        // HTTPS Gateway Listener
+        listeners.add(Listener.newBuilder()
+                .setName("https_gateway")
+                .setAddress(Address.newBuilder()
+                        .setSocketAddress(SocketAddress.newBuilder()
+                                .setAddress("0.0.0.0")
+                                .setPortValue(XdsConfig.HTTPS_GATEWAY_PORT)
+                                .build())
+                        .build())
+                .addFilterChains(FilterChain.newBuilder()
+                        .addFilters(Filter.newBuilder()
+                                .setName("envoy.filters.network.http_connection_manager")
+                                .setTypedConfig(Any.newBuilder()
+                                        .setTypeUrl("type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager")
+                                        .setValue(HttpConnectionManager.newBuilder()
+                                                .setStatPrefix("ingress_https")
+                                                .setCodecType(HttpConnectionManager.CodecType.AUTO)
+                                                .setRouteConfig(RouteConfiguration.newBuilder()
+                                                        .setName("local_route")
+                                                        .addAllVirtualHosts(generateVirtualHosts())
+                                                        .build())
+                                                .addHttpFilters(HttpFilter.newBuilder()
+                                                        .setName("envoy.filters.http.router")
+                                                        .setTypedConfig(Any.newBuilder()
+                                                                .setTypeUrl("type.googleapis.com/envoy.extensions.filters.http.router.v3.Router")
+                                                                .build())
+                                                        .build())
+                                                .build()
+                                                        .toByteString())
+                                        .build())
+                                .build())
+                        .build())
+                .build());
+
+        // TCP Listeners for Arrow Flight SQL
+        listeners.add(generateTcpListener("flight_listener_1", XdsConfig.FLIGHT_PORT_CONTROLLER1, "controller1_flight_cluster"));
+        listeners.add(generateTcpListener("flight_listener_2", XdsConfig.FLIGHT_PORT_CONTROLLER2, "controller2_flight_cluster"));
+        listeners.add(generateTcpListener("flight_listener_ollylake", XdsConfig.FLIGHT_PORT_OLLYLAKE, "ollylake_flight_cluster"));
+
+        // TCP Listeners for PostgreSQL
+        listeners.add(generateTcpListener("tcp_backend_database", XdsConfig.POSTGRES_PORT_BACKEND, "backend_database_tcp"));
+        listeners.add(generateTcpListener("tcp_cluster_database", XdsConfig.POSTGRES_PORT_CLUSTER, "cluster_database_tcp"));
+
+        // HTTP Listener for MinIO S3 API
+        listeners.add(Listener.newBuilder()
+                .setName("minio_s3_api")
+                .setAddress(Address.newBuilder()
+                        .setSocketAddress(SocketAddress.newBuilder()
+                                .setAddress("0.0.0.0")
+                                .setPortValue(XdsConfig.MINIO_S3_API_PORT)
+                                .build())
+                        .build())
+                .addFilterChains(FilterChain.newBuilder()
+                        .addFilters(Filter.newBuilder()
+                                .setName("envoy.filters.network.http_connection_manager")
+                                .setTypedConfig(Any.newBuilder()
+                                        .setTypeUrl("type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager")
+                                        .setValue(HttpConnectionManager.newBuilder()
+                                                .setStatPrefix("minio_s3_api")
+                                                .setCodecType(HttpConnectionManager.CodecType.AUTO)
+                                                .setRouteConfig(RouteConfiguration.newBuilder()
+                                                        .setName("minio_api_route")
+                                                        .addVirtualHosts(VirtualHost.newBuilder()
+                                                                .setName("minio_api")
+                                                                .addDomains("*")
+                                                                .addRoutes(Route.newBuilder()
+                                                                        .setMatch(RouteMatch.newBuilder().setPrefix("/").build())
+                                                                        .setRoute(RouteAction.newBuilder()
+                                                                                .setCluster("minio_api_http")
+                                                                                .setTimeout(Duration.newBuilder().setSeconds(XdsConfig.TIMEOUT_API_LONG).build())
+                                                                                .build())
+                                                                        .build())
+                                                                .build())
+                                                        .build())
+                                                .addHttpFilters(HttpFilter.newBuilder()
+                                                        .setName("envoy.filters.http.router")
+                                                        .setTypedConfig(Any.newBuilder()
+                                                                .setTypeUrl("type.googleapis.com/envoy.extensions.filters.http.router.v3.Router")
+                                                                .build())
+                                                        .build())
+                                                .build()
+                                                        .toByteString())
+                                        .build())
+                                .build())
+                        .build())
+                .build());
+
+        return listeners;
+    }
+
+    private Listener generateTcpListener(String name, int port, String cluster) {
+        io.envoyproxy.envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy tcpProxy = io.envoyproxy.envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy.newBuilder()
+                .setStatPrefix(name)
+                .setCluster(cluster)
+                .setIdleTimeout(Duration.newBuilder().setSeconds(XdsConfig.TIMEOUT_TCP_IDLE).build())
+                .build();
+
+        return Listener.newBuilder()
+                .setName(name)
+                .setAddress(Address.newBuilder()
+                        .setSocketAddress(SocketAddress.newBuilder()
+                                .setAddress("0.0.0.0")
+                                .setPortValue(port)
+                                .build())
+                        .build())
+                .addFilterChains(FilterChain.newBuilder()
+                        .addFilters(Filter.newBuilder()
+                                .setName("envoy.filters.network.tcp_proxy")
+                                .setTypedConfig(Any.newBuilder()
+                                        .setTypeUrl("type.googleapis.com/io.envoyproxy.envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy")
+                                        .setValue(tcpProxy.toByteString())
+                                        .build())
+                                .build())
+                        .build())
+                .build();
+    }
+
+    /**
+     * Generates all virtual hosts for the HTTPS gateway
+     */
+    private List<VirtualHost> generateVirtualHosts() {
+        List<VirtualHost> virtualHosts = new ArrayList<>();
+
+        // Backend host
+        virtualHosts.add(VirtualHost.newBuilder()
+                .setName("backend_host")
+                .addDomains("backend.one211.com")
+                .addDomains("backend.one211.com:*")
+                .addRoutes(Route.newBuilder()
+                        .setMatch(RouteMatch.newBuilder().setPrefix("/").build())
+                        .setRoute(RouteAction.newBuilder()
+                                .setCluster("backend_http")
+                                .setTimeout(Duration.newBuilder().setSeconds(XdsConfig.TIMEOUT_API_STANDARD).build())
+                                .setHostRewriteLiteral("backend.one211.com")
+                                .build())
+                        .build())
+                .build());
+
+        // Controller load balancer
+        virtualHosts.add(VirtualHost.newBuilder()
+                .setName("controller_lb_host")
+                .addDomains("controller.one211.com")
+                .addDomains("controller.one211.com:*")
+                .addRoutes(Route.newBuilder()
+                        .setMatch(RouteMatch.newBuilder()
+                                .setPrefix("/")
+                                .addHeaders(HeaderMatcher.newBuilder()
+                                        .setName(":method")
+                                        .setStringMatch(StringMatcher.newBuilder().setExact("OPTIONS").build())
+                                        .build())
+                                .build())
+                        .setDirectResponse(DirectResponseAction.newBuilder().setStatus(204).build())
+                        .addResponseHeadersToAdd(HeaderValueOption.newBuilder()
+                                .setHeader(HeaderValue.newBuilder().setKey("Access-Control-Allow-Origin").setValue("https://dazzleduck-ui.netlify.app").build())
+                                .build())
+                        .addResponseHeadersToAdd(HeaderValueOption.newBuilder()
+                                .setHeader(HeaderValue.newBuilder().setKey("Access-Control-Allow-Methods").setValue("GET, POST, PUT, DELETE, OPTIONS, PATCH").build())
+                                .build())
+                        .addResponseHeadersToAdd(HeaderValueOption.newBuilder()
+                                .setHeader(HeaderValue.newBuilder().setKey("Access-Control-Allow-Headers").setValue("Authorization, Content-Type").build())
+                                .build())
+                        .build())
+                .addRoutes(Route.newBuilder()
+                        .setMatch(RouteMatch.newBuilder().setPrefix("/").build())
+                        .setRoute(RouteAction.newBuilder()
+                                .setCluster("sql_controller_lb_http")
+                                .setTimeout(Duration.newBuilder().setSeconds(XdsConfig.TIMEOUT_API_LONG).build())
+                                .build())
+                        .addResponseHeadersToAdd(HeaderValueOption.newBuilder()
+                                .setAppendAction(HeaderValueOption.HeaderAppendAction.OVERWRITE_IF_EXISTS_OR_ADD)
+                                .setHeader(HeaderValue.newBuilder().setKey("Access-Control-Allow-Origin").setValue("https://dazzleduck-ui.netlify.app").build())
+                                .build())
+                        .addResponseHeadersToAdd(HeaderValueOption.newBuilder()
+                                .setAppendAction(HeaderValueOption.HeaderAppendAction.OVERWRITE_IF_EXISTS_OR_ADD)
+                                .setHeader(HeaderValue.newBuilder().setKey("Access-Control-Allow-Methods").setValue("GET, POST, PUT, DELETE, OPTIONS, PATCH").build())
+                                .build())
+                        .addResponseHeadersToAdd(HeaderValueOption.newBuilder()
+                                .setAppendAction(HeaderValueOption.HeaderAppendAction.OVERWRITE_IF_EXISTS_OR_ADD)
+                                .setHeader(HeaderValue.newBuilder().setKey("Access-Control-Allow-Headers").setValue("Authorization, Content-Type").build())
+                                .build())
+                        .build())
+                .build());
+
+        // Controller 1 host
+        virtualHosts.add(VirtualHost.newBuilder()
+                .setName("controller1_host")
+                .addDomains("controller1.one211.com")
+                .addDomains("controller1.one211.com:*")
+                .addRoutes(Route.newBuilder()
+                        .setMatch(RouteMatch.newBuilder()
+                                .setPrefix("/")
+                                .addHeaders(HeaderMatcher.newBuilder()
+                                        .setName(":method")
+                                        .setStringMatch(StringMatcher.newBuilder().setExact("OPTIONS").build())
+                                        .build())
+                                .build())
+                        .setDirectResponse(DirectResponseAction.newBuilder().setStatus(204).build())
+                        .addResponseHeadersToAdd(HeaderValueOption.newBuilder()
+                                .setHeader(HeaderValue.newBuilder().setKey("Access-Control-Allow-Origin").setValue("https://dazzleduck-ui.netlify.app").build())
+                                .build())
+                        .addResponseHeadersToAdd(HeaderValueOption.newBuilder()
+                                .setHeader(HeaderValue.newBuilder().setKey("Access-Control-Allow-Methods").setValue("GET, POST, PUT, DELETE, OPTIONS, PATCH").build())
+                                .build())
+                        .addResponseHeadersToAdd(HeaderValueOption.newBuilder()
+                                .setHeader(HeaderValue.newBuilder().setKey("Access-Control-Allow-Headers").setValue("Authorization, Content-Type").build())
+                                .build())
+                        .build())
+                .addRoutes(Route.newBuilder()
+                        .setMatch(RouteMatch.newBuilder().setPrefix("/").build())
+                        .setRoute(RouteAction.newBuilder()
+                                .setCluster("sql_controller1_http")
+                                .setTimeout(Duration.newBuilder().setSeconds(XdsConfig.TIMEOUT_API_LONG).build())
+                                .build())
+                        .addResponseHeadersToAdd(HeaderValueOption.newBuilder()
+                                .setAppendAction(HeaderValueOption.HeaderAppendAction.OVERWRITE_IF_EXISTS_OR_ADD)
+                                .setHeader(HeaderValue.newBuilder().setKey("Access-Control-Allow-Origin").setValue("https://dazzleduck-ui.netlify.app").build())
+                                .build())
+                        .addResponseHeadersToAdd(HeaderValueOption.newBuilder()
+                                .setAppendAction(HeaderValueOption.HeaderAppendAction.OVERWRITE_IF_EXISTS_OR_ADD)
+                                .setHeader(HeaderValue.newBuilder().setKey("Access-Control-Allow-Methods").setValue("GET, POST, PUT, DELETE, OPTIONS, PATCH").build())
+                                .build())
+                        .addResponseHeadersToAdd(HeaderValueOption.newBuilder()
+                                .setAppendAction(HeaderValueOption.HeaderAppendAction.OVERWRITE_IF_EXISTS_OR_ADD)
+                                .setHeader(HeaderValue.newBuilder().setKey("Access-Control-Allow-Headers").setValue("Authorization, Content-Type").build())
+                                .build())
+                        .build())
+                .build());
+
+        // Controller 2 host
+        virtualHosts.add(VirtualHost.newBuilder()
+                .setName("controller2_host")
+                .addDomains("controller2.one211.com")
+                .addDomains("controller2.one211.com:*")
+                .addRoutes(Route.newBuilder()
+                        .setMatch(RouteMatch.newBuilder()
+                                .setPrefix("/")
+                                .addHeaders(HeaderMatcher.newBuilder()
+                                        .setName(":method")
+                                        .setStringMatch(StringMatcher.newBuilder().setExact("OPTIONS").build())
+                                        .build())
+                                .build())
+                        .setDirectResponse(DirectResponseAction.newBuilder().setStatus(204).build())
+                        .addResponseHeadersToAdd(HeaderValueOption.newBuilder()
+                                .setHeader(HeaderValue.newBuilder().setKey("Access-Control-Allow-Origin").setValue("https://dazzleduck-ui.netlify.app").build())
+                                .build())
+                        .addResponseHeadersToAdd(HeaderValueOption.newBuilder()
+                                .setHeader(HeaderValue.newBuilder().setKey("Access-Control-Allow-Methods").setValue("GET, POST, PUT, DELETE, OPTIONS, PATCH").build())
+                                .build())
+                        .addResponseHeadersToAdd(HeaderValueOption.newBuilder()
+                                .setHeader(HeaderValue.newBuilder().setKey("Access-Control-Allow-Headers").setValue("Authorization, Content-Type").build())
+                                .build())
+                        .build())
+                .addRoutes(Route.newBuilder()
+                        .setMatch(RouteMatch.newBuilder().setPrefix("/").build())
+                        .setRoute(RouteAction.newBuilder()
+                                .setCluster("sql_controller2_http")
+                                .setTimeout(Duration.newBuilder().setSeconds(XdsConfig.TIMEOUT_API_LONG).build())
+                                .build())
+                        .addResponseHeadersToAdd(HeaderValueOption.newBuilder()
+                                .setAppendAction(HeaderValueOption.HeaderAppendAction.OVERWRITE_IF_EXISTS_OR_ADD)
+                                .setHeader(HeaderValue.newBuilder().setKey("Access-Control-Allow-Origin").setValue("https://dazzleduck-ui.netlify.app").build())
+                                .build())
+                        .addResponseHeadersToAdd(HeaderValueOption.newBuilder()
+                                .setAppendAction(HeaderValueOption.HeaderAppendAction.OVERWRITE_IF_EXISTS_OR_ADD)
+                                .setHeader(HeaderValue.newBuilder().setKey("Access-Control-Allow-Methods").setValue("GET, POST, PUT, DELETE, OPTIONS, PATCH").build())
+                                .build())
+                        .addResponseHeadersToAdd(HeaderValueOption.newBuilder()
+                                .setAppendAction(HeaderValueOption.HeaderAppendAction.OVERWRITE_IF_EXISTS_OR_ADD)
+                                .setHeader(HeaderValue.newBuilder().setKey("Access-Control-Allow-Headers").setValue("Authorization, Content-Type").build())
+                                .build())
+                        .build())
+                .build());
+
+        // MinIO console host
+        virtualHosts.add(VirtualHost.newBuilder()
+                .setName("minio_console_host")
+                .addDomains("minio.one211.com")
+                .addDomains("minio.one211.com:*")
+                .addRoutes(Route.newBuilder()
+                        .setMatch(RouteMatch.newBuilder().setPrefix("/").build())
+                        .setRoute(RouteAction.newBuilder()
+                                .setCluster("minio_console_http")
+                                .setTimeout(Duration.newBuilder().setSeconds(XdsConfig.TIMEOUT_API_STANDARD).build())
+                                .setHostRewriteLiteral("minio.one211.com")
+                                .build())
+                        .build())
+                .build());
+
+        // OllyLake host
+        virtualHosts.add(VirtualHost.newBuilder()
+                .setName("ollylake_host")
+                .addDomains("ollylake.one211.com")
+                .addDomains("ollylake.one211.com:*")
+                .addRoutes(Route.newBuilder()
+                        .setMatch(RouteMatch.newBuilder().setPrefix("/").build())
+                        .setRoute(RouteAction.newBuilder()
+                                .setCluster("ollylake_http")
+                                .setTimeout(Duration.newBuilder().setSeconds(XdsConfig.TIMEOUT_API_SHORT).build())
+                                .setHostRewriteLiteral("ollylake.one211.com")
+                                .build())
+                        .build())
+                .build());
+
+        // Frontend host (catch-all)
+        virtualHosts.add(VirtualHost.newBuilder()
+                .setName("frontend_host")
+                .addDomains("frontend.one211.com")
+                .addDomains("frontend.one211.com:*")
+                .addDomains("www.one211.com")
+                .addDomains("www.one211.com:*")
+                .addDomains("localhost")
+                .addDomains("localhost:*")
+                .addDomains("*")
+                .addRoutes(Route.newBuilder()
+                        .setMatch(RouteMatch.newBuilder()
+                                .setPrefix("/")
+                                .addHeaders(HeaderMatcher.newBuilder()
+                                        .setName("upgrade")
+                                        .setPresentMatch(true)
+                                        .build())
+                                .build())
+                        .setRoute(RouteAction.newBuilder()
+                                .setCluster("frontend_http")
+                                .setTimeout(Duration.newBuilder().setSeconds(XdsConfig.TIMEOUT_IMMEDIATE).build())
+                                .build())
+                        .build())
+                .addRoutes(Route.newBuilder()
+                        .setMatch(RouteMatch.newBuilder().setPrefix("/api/").build())
+                        .setRoute(RouteAction.newBuilder()
+                                .setCluster("backend_http")
+                                .setTimeout(Duration.newBuilder().setSeconds(XdsConfig.TIMEOUT_API_LONG).build())
+                                .build())
+                        .build())
+                .addRoutes(Route.newBuilder()
+                        .setMatch(RouteMatch.newBuilder().setPrefix("/").build())
+                        .setRoute(RouteAction.newBuilder()
+                                .setCluster("frontend_http")
+                                .setTimeout(Duration.newBuilder().setSeconds(XdsConfig.TIMEOUT_API_STANDARD).build())
+                                .setHostRewriteLiteral("localhost:5173")
+                                .build())
+                        .build())
+                .build());
+
+        return virtualHosts;
+    }
+
+    /**
+     * Generates route configurations
+     */
+    private List<RouteConfiguration> generateRoutes() {
+        return List.of(
+                RouteConfiguration.newBuilder()
+                        .setName("local_route")
+                        .addAllVirtualHosts(generateVirtualHosts())
+                        .build(),
+                RouteConfiguration.newBuilder()
+                        .setName("minio_api_route")
+                        .addVirtualHosts(VirtualHost.newBuilder()
+                                .setName("minio_api")
+                                .addDomains("*")
+                                .addRoutes(Route.newBuilder()
+                                        .setMatch(RouteMatch.newBuilder().setPrefix("/").build())
+                                        .setRoute(RouteAction.newBuilder()
+                                                .setCluster("minio_api_http")
+                                                .setTimeout(Duration.newBuilder().setSeconds(XdsConfig.TIMEOUT_API_LONG).build())
+                                                .build())
+                                        .build())
+                                .build())
+                        .build()
+        );
+    }
+
+    /**
+     * Generates all cluster configurations
+     */
+    private List<Cluster> generateClusters() {
+        List<Cluster> clusters = new ArrayList<>();
+
+        // Backend HTTP
+        clusters.add(createHttpCluster("backend_http", "application-backend", XdsConfig.SERVICE_PORT_BACKEND));
+        // Frontend HTTP
+        clusters.add(createHttpCluster("frontend_http", "frontend", XdsConfig.SERVICE_PORT_FRONTEND));
+        // MinIO S3 API
+        clusters.add(createHttpCluster("minio_api_http", "minio", XdsConfig.SERVICE_PORT_MINIO_API));
+        // MinIO Console
+        clusters.add(createHttpCluster("minio_console_http", "minio", XdsConfig.SERVICE_PORT_MINIO_CONSOLE));
+        // OllyLake HTTP
+        clusters.add(createHttpCluster("ollylake_http", "ollylake", XdsConfig.SERVICE_PORT_OLLYLAKE_HTTP));
+
+        // Controller Load Balancer - will have endpoints updated dynamically
+        clusters.add(Cluster.newBuilder()
+                .setName("sql_controller_lb_http")
+                .setType(Cluster.DiscoveryType.STRICT_DNS)
+                .setLbPolicy(Cluster.LbPolicy.ROUND_ROBIN)
+                .setConnectTimeout(Duration.newBuilder().setSeconds(XdsConfig.TIMEOUT_TCP_CONNECT).build())
+                .build());
+
+        // Controller 1 HTTP - will have endpoints updated dynamically
+        clusters.add(Cluster.newBuilder()
+                .setName("sql_controller1_http")
+                .setType(Cluster.DiscoveryType.STRICT_DNS)
+                .setLbPolicy(Cluster.LbPolicy.ROUND_ROBIN)
+                .setConnectTimeout(Duration.newBuilder().setSeconds(XdsConfig.TIMEOUT_TCP_CONNECT).build())
+                .build());
+
+        // Controller 2 HTTP - will have endpoints updated dynamically
+        clusters.add(Cluster.newBuilder()
+                .setName("sql_controller2_http")
+                .setType(Cluster.DiscoveryType.STRICT_DNS)
+                .setLbPolicy(Cluster.LbPolicy.ROUND_ROBIN)
+                .setConnectTimeout(Duration.newBuilder().setSeconds(XdsConfig.TIMEOUT_TCP_CONNECT).build())
+                .build());
+
+        // TCP Clusters - will have endpoints updated dynamically
+        clusters.add(createTcpCluster("controller1_flight_cluster"));
+        clusters.add(createTcpCluster("controller2_flight_cluster"));
+        clusters.add(createTcpCluster("ollylake_flight_cluster"));
+        clusters.add(createTcpCluster("backend_database_tcp"));
+        clusters.add(createTcpCluster("cluster_database_tcp"));
+
+        return clusters;
+    }
+
+    private Cluster createHttpCluster(String name, String address, int port) {
+        return Cluster.newBuilder()
+                .setName(name)
+                .setType(Cluster.DiscoveryType.STRICT_DNS)
+                .setLbPolicy(Cluster.LbPolicy.ROUND_ROBIN)
+                .setConnectTimeout(Duration.newBuilder().setSeconds(XdsConfig.TIMEOUT_TCP_CONNECT).build())
+                .setLoadAssignment(ClusterLoadAssignment.newBuilder()
+                        .setClusterName(name)
+                        .addEndpoints(LocalityLbEndpoints.newBuilder()
+                                .addLbEndpoints(LbEndpoint.newBuilder()
+                                        .setEndpoint(Endpoint.newBuilder()
+                                                .setAddress(Address.newBuilder()
+                                                        .setSocketAddress(SocketAddress.newBuilder()
+                                                                .setAddress(address)
+                                                                .setPortValue(port)
+                                                                .build())
+                                                        .build())
+                                                .build())
+                                        .build())
+                                .build())
+                        .build())
+                .build();
+    }
+
+    private Cluster createTcpCluster(String name) {
+        return Cluster.newBuilder()
+                .setName(name)
+                .setType(Cluster.DiscoveryType.EDS)
+                .setLbPolicy(Cluster.LbPolicy.ROUND_ROBIN)
+                .setConnectTimeout(Duration.newBuilder().setSeconds(XdsConfig.TIMEOUT_TCP_CONNECT).build())
+                .setEdsClusterConfig(Cluster.EdsClusterConfig.newBuilder()
+                        .setEdsConfig(ConfigSource.newBuilder()
+                                .setApiConfigSource(ApiConfigSource.newBuilder()
+                                        .setApiType(ApiConfigSource.ApiType.GRPC)
+                                        .addGrpcServices(GrpcService.newBuilder()
+                                                .setEnvoyGrpc(GrpcService.EnvoyGrpc.newBuilder()
+                                                        .setClusterName("xds_cluster")
+                                                        .build())
+                                                .build())
+                                        .build())
+                                .build())
+                        .build())
+                .build();
+    }
+
+    /**
+     * Generates endpoint configurations
+     */
+    private List<ClusterLoadAssignment> generateEndpoints() {
+        List<ClusterLoadAssignment> endpoints = new ArrayList<>();
+
+        // Controller Load Balancer Endpoints
+        endpoints.add(ClusterLoadAssignment.newBuilder()
+                .setClusterName("sql_controller_lb_http")
+                .addEndpoints(LocalityLbEndpoints.newBuilder()
+                        .addLbEndpoints(LbEndpoint.newBuilder()
+                                .setEndpoint(Endpoint.newBuilder()
+                                        .setAddress(Address.newBuilder()
+                                                .setSocketAddress(SocketAddress.newBuilder()
+                                                        .setAddress("sql-controller1")
+                                                        .setPortValue(9006)
+                                                        .build())
+                                                .build())
+                                        .build())
+                                .build())
+                        .addLbEndpoints(LbEndpoint.newBuilder()
+                                .setEndpoint(Endpoint.newBuilder()
+                                        .setAddress(Address.newBuilder()
+                                                .setSocketAddress(SocketAddress.newBuilder()
+                                                        .setAddress("sql-controller2")
+                                                        .setPortValue(9007)
+                                                        .build())
+                                                .build())
+                                        .build())
+                                .build())
+                        .build())
+                .build());
+
+        // Controller 1 HTTP Endpoints
+        endpoints.add(ClusterLoadAssignment.newBuilder()
+                .setClusterName("sql_controller1_http")
+                .addEndpoints(LocalityLbEndpoints.newBuilder()
+                        .addLbEndpoints(LbEndpoint.newBuilder()
+                                .setEndpoint(Endpoint.newBuilder()
+                                        .setAddress(Address.newBuilder()
+                                                .setSocketAddress(SocketAddress.newBuilder()
+                                                        .setAddress("sql-controller1")
+                                                        .setPortValue(9006)
+                                                        .build())
+                                                .build())
+                                        .build())
+                                .build())
+                        .build())
+                .build());
+
+        // Controller 2 HTTP Endpoints
+        endpoints.add(ClusterLoadAssignment.newBuilder()
+                .setClusterName("sql_controller2_http")
+                .addEndpoints(LocalityLbEndpoints.newBuilder()
+                        .addLbEndpoints(LbEndpoint.newBuilder()
+                                .setEndpoint(Endpoint.newBuilder()
+                                        .setAddress(Address.newBuilder()
+                                                .setSocketAddress(SocketAddress.newBuilder()
+                                                        .setAddress("sql-controller2")
+                                                        .setPortValue(9007)
+                                                        .build())
+                                                .build())
+                                        .build())
+                                .build())
+                        .build())
+                .build());
+
+        // Flight Controller 1 Endpoints
+        endpoints.add(ClusterLoadAssignment.newBuilder()
+                .setClusterName("controller1_flight_cluster")
+                .addEndpoints(LocalityLbEndpoints.newBuilder()
+                        .addLbEndpoints(LbEndpoint.newBuilder()
+                                .setEndpoint(Endpoint.newBuilder()
+                                        .setAddress(Address.newBuilder()
+                                                .setSocketAddress(SocketAddress.newBuilder()
+                                                        .setAddress("sql-controller1")
+                                                        .setPortValue(59307)
+                                                        .build())
+                                                .build())
+                                        .build())
+                                .build())
+                        .build())
+                .build());
+
+        // Flight Controller 2 Endpoints
+        endpoints.add(ClusterLoadAssignment.newBuilder()
+                .setClusterName("controller2_flight_cluster")
+                .addEndpoints(LocalityLbEndpoints.newBuilder()
+                        .addLbEndpoints(LbEndpoint.newBuilder()
+                                .setEndpoint(Endpoint.newBuilder()
+                                        .setAddress(Address.newBuilder()
+                                                .setSocketAddress(SocketAddress.newBuilder()
+                                                        .setAddress("sql-controller2")
+                                                        .setPortValue(59301)
+                                                        .build())
+                                                .build())
+                                        .build())
+                                .build())
+                        .build())
+                .build());
+
+        // Flight OllyLake Endpoints
+        endpoints.add(ClusterLoadAssignment.newBuilder()
+                .setClusterName("ollylake_flight_cluster")
+                .addEndpoints(LocalityLbEndpoints.newBuilder()
+                        .addLbEndpoints(LbEndpoint.newBuilder()
+                                .setEndpoint(Endpoint.newBuilder()
+                                        .setAddress(Address.newBuilder()
+                                                .setSocketAddress(SocketAddress.newBuilder()
+                                                        .setAddress("ollylake")
+                                                        .setPortValue(59305)
+                                                        .build())
+                                                .build())
+                                        .build())
+                                .build())
+                        .build())
+                .build());
+
+        // Database Endpoints
+        endpoints.add(ClusterLoadAssignment.newBuilder()
+                .setClusterName("backend_database_tcp")
+                .addEndpoints(LocalityLbEndpoints.newBuilder()
+                        .addLbEndpoints(LbEndpoint.newBuilder()
+                                .setEndpoint(Endpoint.newBuilder()
+                                        .setAddress(Address.newBuilder()
+                                                .setSocketAddress(SocketAddress.newBuilder()
+                                                        .setAddress("backend-database")
+                                                        .setPortValue(5432)
+                                                        .build())
+                                                .build())
+                                        .build())
+                                .build())
+                        .build())
+                .build());
+
+        endpoints.add(ClusterLoadAssignment.newBuilder()
+                .setClusterName("cluster_database_tcp")
+                .addEndpoints(LocalityLbEndpoints.newBuilder()
+                        .addLbEndpoints(LbEndpoint.newBuilder()
+                                .setEndpoint(Endpoint.newBuilder()
+                                        .setAddress(Address.newBuilder()
+                                                .setSocketAddress(SocketAddress.newBuilder()
+                                                        .setAddress("org1-cluster1-postgres")
+                                                        .setPortValue(5432)
+                                                        .build())
+                                                .build())
+                                        .build())
+                                .build())
+                        .build())
+                .build());
+
+        // Add dynamic endpoints from runtime API calls
+        for (Map.Entry<String, List<EndpointConfig>> entry : dynamicEndpoints.entrySet()) {
+            String clusterName = entry.getKey();
+            List<EndpointConfig> endpointConfigs = entry.getValue();
+
+            ClusterLoadAssignment.Builder clusterAssignment = ClusterLoadAssignment.newBuilder()
+                    .setClusterName(clusterName);
+
+            LocalityLbEndpoints.Builder localityLbEndpoints = LocalityLbEndpoints.newBuilder();
+            for (EndpointConfig endpointConfig : endpointConfigs) {
+                localityLbEndpoints.addLbEndpoints(LbEndpoint.newBuilder()
+                        .setEndpoint(Endpoint.newBuilder()
+                                .setAddress(Address.newBuilder()
+                                        .setSocketAddress(SocketAddress.newBuilder()
+                                                .setAddress(endpointConfig.getHost())
+                                                .setPortValue(endpointConfig.getPort())
+                                                .build())
+                                        .build())
+                                .build())
+                        .build());
+            }
+
+            clusterAssignment.addEndpoints(localityLbEndpoints.build());
+            endpoints.add(clusterAssignment.build());
+
+            logger.debug("Added dynamic endpoint configuration for cluster {} with {} endpoints",
+                    clusterName, endpointConfigs.size());
+        }
+
+        return endpoints;
+    }
+
+    /**
+     * Checks if configuration files have changed
+     *
+     * @return true if any configuration file has been modified since last check
+     */
+    public boolean hasConfigurationChanged() {
+        Path configDir = Paths.get("/config");
+        if (!Files.exists(configDir)) {
+            return false;
+        }
+
+        try {
+            AtomicBoolean changed = new AtomicBoolean(false);
+            Files.list(configDir)
+                    .filter(p -> p.toString().endsWith(".yaml"))
+                    .forEach(p -> {
+                        try {
+                            FileTime current = Files.getLastModifiedTime(p);
+                            FileTime previous = fileTimestamps.get(p.toString());
+                            if (previous == null || !current.equals(previous)) {
+                                // File has changed or is new
+                                changed.set(true);
+                                // Update timestamp after checking
+                                fileTimestamps.put(p.toString(), current);
+                                logger.debug("Configuration file changed: {}", p);
+                            }
+                        } catch (IOException e) {
+                            logger.warn("Failed to check file timestamp: {}", p, e);
+                        }
+                    });
+            return changed.get();
+        } catch (IOException e) {
+            logger.warn("Failed to list configuration files", e);
+            return false;
+        }
+    }
+
+    /**
+     * Adds a new cluster dynamically
+     *
+     * @param clusterConfig JSON string with cluster configuration
+     *                   Format: {"name": "cluster_name", "type": "STRICT_DNS", "address": "host", "port": 8080}
+     */
+    public void addCluster(String clusterConfig) throws IOException {
+        logger.info("Adding new cluster: {}", clusterConfig);
+
+        try {
+            // Try to parse as AddClusterRequest format first
+            try {
+                AddClusterRequest request = jsonMapper.readValue(clusterConfig, AddClusterRequest.class);
+                logger.info("Parsed cluster request: name={}, type={}, address={}, port={}",
+                        request.name(), request.type(), request.address(), request.port());
+
+                // Create a single endpoint for the cluster
+                EndpointConfig endpoint = new EndpointConfig(request.name(), request.address(), request.port());
+                dynamicEndpoints.put(request.name(), List.of(endpoint));
+
+                logger.info("Added cluster {} with endpoint {}:{}", request.name(), request.address(), request.port());
+            } catch (Exception e) {
+                // If that fails, try the simpler cluster_name format
+                SimpleClusterRequest request = jsonMapper.readValue(clusterConfig, SimpleClusterRequest.class);
+                logger.info("Parsed simple cluster request: name={}", request.cluster_name());
+
+                if (request.endpoints() != null) {
+                    List<EndpointConfig> endpoints = request.endpoints().stream()
+                            .map(ep -> {
+                                if (ep instanceof String) {
+                                    String[] parts = ((String) ep).split(":");
+                                    if (parts.length != 2) {
+                                        throw new IllegalArgumentException("Invalid endpoint format: " + ep);
+                                    }
+                                    return new EndpointConfig(request.cluster_name(), parts[0], Integer.parseInt(parts[1]));
+                                }
+                                // Support object format
+                                Map<String, Object> epMap = (Map<String, Object>) ep;
+                                String host = (String) epMap.get("host");
+                                Integer port = (Integer) epMap.get("port");
+                                return new EndpointConfig(request.cluster_name(), host, port);
+                            })
+                            .collect(Collectors.toList());
+
+                    dynamicEndpoints.put(request.cluster_name(), endpoints);
+                    logger.info("Added {} endpoints for cluster {}", endpoints.size(), request.cluster_name());
+                }
+            }
+
+            // Update configuration timestamp to trigger refresh
+            updateConfigurationTimestamp();
+
+        } catch (Exception e) {
+            logger.error("Failed to add cluster", e);
+            throw new IOException("Failed to parse cluster configuration: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Updates endpoints dynamically for an existing cluster
+     *
+     * @param endpointConfig JSON string with endpoint configuration
+     *                     Format: {"clusterName": "cluster_name", "endpoints": [{"host": "host", "port": 8080}, ...]}
+     */
+    public void updateEndpoints(String endpointConfig) throws IOException {
+        logger.info("Updating endpoints: {}", endpointConfig);
+
+        try {
+            // Try to parse as EndpointUpdateRequest format first
+            try {
+                EndpointUpdateRequest request = jsonMapper.readValue(endpointConfig, EndpointUpdateRequest.class);
+                logger.info("Parsed endpoint update request: clusterName={}", request.clusterName());
+
+                List<EndpointConfig> endpoints = request.endpoints().stream()
+                        .map(ep -> new EndpointConfig(request.clusterName(), ep.host(), ep.port()))
+                        .collect(Collectors.toList());
+
+                dynamicEndpoints.put(request.clusterName(), endpoints);
+                logger.info("Updated {} endpoints for cluster {}", endpoints.size(), request.clusterName());
+            } catch (Exception e) {
+                // If that fails, try the simpler cluster_name format
+                SimpleClusterRequest request = jsonMapper.readValue(endpointConfig, SimpleClusterRequest.class);
+                logger.info("Parsed simple cluster request: name={}", request.cluster_name());
+
+                List<EndpointConfig> endpoints = request.endpoints().stream()
+                        .map(ep -> {
+                            if (ep instanceof String) {
+                                String[] parts = ((String) ep).split(":");
+                                if (parts.length != 2) {
+                                    throw new IllegalArgumentException("Invalid endpoint format: " + ep);
+                                }
+                                return new EndpointConfig(request.cluster_name(), parts[0], Integer.parseInt(parts[1]));
+                            }
+                            // Support object format
+                            Map<String, Object> epMap = (Map<String, Object>) ep;
+                            String host = (String) epMap.get("host");
+                            Integer port = (Integer) epMap.get("port");
+                            return new EndpointConfig(request.cluster_name(), host, port);
+                        })
+                        .collect(Collectors.toList());
+
+                dynamicEndpoints.put(request.cluster_name(), endpoints);
+                logger.info("Updated {} endpoints for cluster {}", endpoints.size(), request.cluster_name());
+            }
+
+            // Update configuration timestamp to trigger refresh
+            updateConfigurationTimestamp();
+
+        } catch (Exception e) {
+            logger.error("Failed to update endpoints", e);
+            throw new IOException("Failed to parse endpoint configuration: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Force a configuration timestamp update to trigger snapshot refresh
+     */
+    private void updateConfigurationTimestamp() {
+        Path configDir = Paths.get("/config");
+        if (Files.exists(configDir)) {
+            try {
+                // Update a marker file timestamp to trigger configuration reload
+                Path markerFile = configDir.resolve(".update-marker");
+                Files.writeString(markerFile, String.valueOf(System.currentTimeMillis()));
+                Files.setLastModifiedTime(markerFile, FileTime.fromMillis(System.currentTimeMillis()));
+            } catch (IOException e) {
+                logger.warn("Failed to update configuration marker file", e);
+            }
+        }
+    }
+
+    /**
+     * Inner class for parsing cluster/endpoint requests
+     */
+    private record AddClusterRequest(String name, String type, String address, int port) {
+    }
+
+    /**
+     * Inner class for parsing endpoint update requests
+     */
+    private record EndpointUpdateRequest(String clusterName, List<EndpointData> endpoints) {
+    }
+
+    /**
+     * Inner class for parsing endpoint objects
+     */
+    private record EndpointData(String host, int port) {
+    }
+
+    /**
+     * Inner class for parsing simple cluster/endpoint requests
+     */
+    private record SimpleClusterRequest(String cluster_name, List<Object> endpoints) {
+    }
+
+    /**
+     * Inner class for endpoint configuration
+     */
+    public static class EndpointConfig {
+        private String clusterName;
+        private String host;
+        private int port;
+
+        public EndpointConfig(String clusterName, String host, int port) {
+            this.clusterName = clusterName;
+            this.host = host;
+            this.port = port;
+        }
+
+        // Getters and setters
+        public String getClusterName() { return clusterName; }
+        public String getHost() { return host; }
+        public int getPort() { return port; }
+    }
+}
