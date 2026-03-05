@@ -53,12 +53,17 @@ public class XdsConfigManager {
     private final ObjectMapper jsonMapper;
     private final Map<String, FileTime> fileTimestamps;
     private final Map<String, List<EndpointConfig>> dynamicEndpoints;
+    private final Map<String, RouteConfig> dynamicRoutes;
+    private final Map<String, RouteTemplate> routeTemplates;
 
     public XdsConfigManager() {
         this.yamlMapper = new ObjectMapper(new YAMLFactory());
         this.jsonMapper = new ObjectMapper();
         this.fileTimestamps = new ConcurrentHashMap<>();
         this.dynamicEndpoints = new ConcurrentHashMap<>();
+        this.dynamicRoutes = new ConcurrentHashMap<>();
+        this.routeTemplates = new ConcurrentHashMap<>();
+        initializeRouteTemplates();
     }
 
     /**
@@ -218,6 +223,8 @@ public class XdsConfigManager {
      */
     private List<VirtualHost> generateVirtualHosts() {
         List<VirtualHost> virtualHosts = new ArrayList<>();
+
+        // === Static Virtual Hosts (Highest Priority - Most Specific) ===
 
         // Backend host
         virtualHosts.add(VirtualHost.newBuilder()
@@ -399,7 +406,34 @@ public class XdsConfigManager {
                         .build())
                 .build());
 
-        // Frontend host (catch-all)
+        // === Dynamic Virtual Hosts (Sorted by Priority) ===
+        // Lower priority number = matched first
+        List<RouteConfig> sortedRoutes = dynamicRoutes.values().stream()
+                .sorted(Comparator.comparingInt(RouteConfig::getPriority))
+                .collect(Collectors.toList());
+
+        for (RouteConfig route : sortedRoutes) {
+            VirtualHost.Builder vhBuilder = VirtualHost.newBuilder()
+                    .setName("dynamic_" + route.getDomain().replace(".", "_").replace("*", "wildcard"))
+                    .addDomains(route.getDomain())
+                    .addDomains(route.getDomain() + ":*");
+
+            // Add the route
+            vhBuilder.addRoutes(Route.newBuilder()
+                    .setMatch(RouteMatch.newBuilder().setPrefix(route.getPrefix()).build())
+                    .setRoute(RouteAction.newBuilder()
+                            .setCluster(route.getCluster())
+                            .setTimeout(Duration.newBuilder()
+                                    .setSeconds(XdsConfig.TIMEOUT_API_LONG).build())
+                            .build())
+                    .build());
+
+            virtualHosts.add(vhBuilder.build());
+            logger.info("Added dynamic route: {} -> {} (priority: {})",
+                    route.getDomain(), route.getCluster(), route.getPriority());
+        }
+
+        // Frontend host (catch-all) - Keep at the end for lowest priority
         virtualHosts.add(VirtualHost.newBuilder()
                 .setName("frontend_host")
                 .addDomains("frontend.one211.com")
@@ -408,7 +442,6 @@ public class XdsConfigManager {
                 .addDomains("www.one211.com:*")
                 .addDomains("localhost")
                 .addDomains("localhost:*")
-                .addDomains("*")
                 .addRoutes(Route.newBuilder()
                         .setMatch(RouteMatch.newBuilder()
                                 .setPrefix("/")
@@ -916,6 +949,198 @@ public class XdsConfigManager {
     }
 
     /**
+     * Initialize default route templates
+     */
+    private void initializeRouteTemplates() {
+        // Template for controller subdomains
+        routeTemplates.put("controller", new RouteTemplate(
+            "controller*.one211.com",
+            "sql_controller_lb_http",
+            "/",
+            50
+        ));
+
+        // Template for wildcard all subdomains
+        routeTemplates.put("wildcard", new RouteTemplate(
+            "*.one211.com",
+            "sql_controller_lb_http",
+            "/",
+            1000
+        ));
+
+        // Template for xyz_* pattern
+        routeTemplates.put("xyz_pattern", new RouteTemplate(
+            "xyz_*.one211.com",
+            "sql_controller_lb_http",
+            "/",
+            100
+        ));
+
+        logger.info("Initialized {} route templates", routeTemplates.size());
+    }
+
+    /**
+     * Adds a new route dynamically
+     *
+     * @param routeConfig JSON string with route configuration
+     *                   Format: {"domain": "*.one211.com", "cluster": "cluster_name", "prefix": "/", "priority": 10}
+     */
+    public void addRoute(String routeConfig) throws IOException {
+        updateRoute(routeConfig);
+    }
+
+    /**
+     * Updates or adds a route dynamically (alias for addRoute)
+     *
+     * @param routeConfig JSON string with route configuration
+     *                   Format: {"domain": "*.one211.com", "cluster": "cluster_name", "prefix": "/", "priority": 10}
+     */
+    public void updateRoute(String routeConfig) throws IOException {
+        logger.info("Adding/updating route: {}", routeConfig);
+
+        try {
+            EnhancedRouteRequest request = jsonMapper.readValue(routeConfig, EnhancedRouteRequest.class);
+            logger.info("Parsed route request: domain={}, cluster={}, prefix={}, priority={}",
+                request.domain(), request.cluster(), request.prefix(), request.priority());
+
+            // Validate required fields
+            if (request.domain() == null || request.domain().trim().isEmpty()) {
+                throw new IllegalArgumentException("Domain is required");
+            }
+            if (request.cluster() == null || request.cluster().trim().isEmpty()) {
+                throw new IllegalArgumentException("Cluster is required");
+            }
+
+            // Trim domain and cluster
+            String domain = request.domain().trim();
+            String cluster = request.cluster().trim();
+
+            // Validate prefix - must start with '/'
+            String prefix = request.prefix();
+            if (prefix == null || prefix.trim().isEmpty()) {
+                prefix = "/";
+            } else {
+                prefix = prefix.trim();
+                if (!prefix.startsWith("/")) {
+                    throw new IllegalArgumentException("Prefix must start with '/'");
+                }
+            }
+
+            // Validate domain pattern
+            if (!isValidDomainPattern(domain)) {
+                throw new IllegalArgumentException("Invalid domain pattern: " + domain);
+            }
+
+            RouteConfig config = new RouteConfig(
+                domain,
+                cluster,
+                prefix,
+                request.priority()
+            );
+
+            dynamicRoutes.put(domain, config);
+            logger.info("Added/updated route {} -> {} (priority: {})",
+                domain, cluster, request.priority());
+
+            updateConfigurationTimestamp();
+
+        } catch (Exception e) {
+            logger.error("Failed to add/update route", e);
+            throw new IOException("Failed to parse route configuration: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Deletes a route by domain pattern
+     *
+     * @param domainPattern the domain pattern to delete
+     */
+    public void deleteRoute(String domainPattern) {
+        logger.info("Deleting route for domain: {}", domainPattern);
+
+        RouteConfig removed = dynamicRoutes.remove(domainPattern);
+        if (removed != null) {
+            logger.info("Deleted route: {} -> {}", domainPattern, removed.getCluster());
+            updateConfigurationTimestamp();
+        } else {
+            logger.warn("No route found for domain pattern: {}", domainPattern);
+        }
+    }
+
+    /**
+     * Lists all dynamic routes
+     *
+     * @return JSON string of all routes
+     */
+    public String listRoutes() throws IOException {
+        List<Map<String, Object>> routes = new ArrayList<>();
+
+        for (RouteConfig route : dynamicRoutes.values()) {
+            Map<String, Object> routeInfo = new HashMap<>();
+            routeInfo.put("domain", route.getDomain());
+            routeInfo.put("cluster", route.getCluster());
+            routeInfo.put("prefix", route.getPrefix());
+            routeInfo.put("priority", route.getPriority());
+            routes.add(routeInfo);
+        }
+
+        // Sort by priority
+        routes.sort(Comparator.comparingInt(r -> (Integer) r.get("priority")));
+
+        Map<String, Object> response = new HashMap<>();
+        response.put("routes", routes);
+        response.put("count", routes.size());
+
+        return jsonMapper.writeValueAsString(response);
+    }
+
+    /**
+     * Adds a route from a template
+     *
+     * @param templateName the name of the template to use
+     * @param clusterOverride optional cluster name to override the template's default
+     * @throws IOException if template not found or configuration fails
+     */
+    public void addRouteFromTemplate(String templateName, String clusterOverride) throws IOException {
+        RouteTemplate template = routeTemplates.get(templateName);
+        if (template == null) {
+            throw new IllegalArgumentException("Template not found: " + templateName);
+        }
+
+        String domain = template.domain();
+        String cluster = clusterOverride != null ? clusterOverride : template.cluster();
+
+        RouteConfig config = new RouteConfig(
+            domain,
+            cluster,
+            template.prefix(),
+            template.priority()
+        );
+
+        dynamicRoutes.put(domain, config);
+        logger.info("Created route from template {}: {} -> {} (priority: {})",
+            templateName, domain, cluster, template.priority());
+
+        updateConfigurationTimestamp();
+    }
+
+    /**
+     * Validates a domain pattern
+     *
+     * @param domain the domain pattern to validate
+     * @return true if valid, false otherwise
+     */
+    private boolean isValidDomainPattern(String domain) {
+        if (domain == null || domain.isEmpty()) {
+            return false;
+        }
+
+        // Support exact domains, wildcards (*), and patterns (*, but no other regex)
+        // Common patterns: *.one211.com, controller*.one211.com, etc.
+        return domain.matches("^[a-zA-Z0-9._*:-]+$");
+    }
+
+    /**
      * Inner class for parsing cluster/endpoint requests
      */
     private record AddClusterRequest(String name, String type, String address, int port) {
@@ -957,5 +1182,67 @@ public class XdsConfigManager {
         public String getClusterName() { return clusterName; }
         public String getHost() { return host; }
         public int getPort() { return port; }
+    }
+
+    /**
+     * Inner class for parsing route requests with enhanced fields
+     */
+    private record EnhancedRouteRequest(
+        String domain,
+        String cluster,
+        String prefix,
+        int priority
+    ) {
+        // Default values
+        public EnhancedRouteRequest(String domain, String cluster, String prefix, int priority) {
+            this.domain = domain;
+            this.cluster = cluster;
+            this.prefix = prefix != null ? prefix : "/";
+            this.priority = priority > 0 ? priority : 100;
+        }
+    }
+
+    /**
+     * Inner class for route configuration
+     */
+    public static class RouteConfig {
+        private String domain;
+        private String cluster;
+        private String prefix;
+        private int priority;
+
+        public RouteConfig(String domain, String cluster, String prefix, int priority) {
+            this.domain = domain;
+            this.cluster = cluster;
+            this.prefix = prefix;
+            this.priority = priority;
+        }
+
+        public String getDomain() { return domain; }
+        public String getCluster() { return cluster; }
+        public String getPrefix() { return prefix; }
+        public int getPriority() { return priority; }
+    }
+
+    /**
+     * Inner class for route templates
+     */
+    public static class RouteTemplate {
+        private String domain;
+        private String cluster;
+        private String prefix;
+        private int priority;
+
+        public RouteTemplate(String domain, String cluster, String prefix, int priority) {
+            this.domain = domain;
+            this.cluster = cluster;
+            this.prefix = prefix;
+            this.priority = priority;
+        }
+
+        public String domain() { return domain; }
+        public String cluster() { return cluster; }
+        public String prefix() { return prefix; }
+        public int priority() { return priority; }
     }
 }

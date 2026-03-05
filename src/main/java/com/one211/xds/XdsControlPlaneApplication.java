@@ -6,6 +6,7 @@ import com.one211.xds.auth.LoginHandler;
 import com.one211.xds.auth.UserStore;
 import com.one211.xds.config.ConfigLoader;
 import com.one211.xds.config.XdsConfig;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.envoyproxy.controlplane.cache.v3.SimpleCache;
 import io.envoyproxy.controlplane.cache.v3.Snapshot;
 import io.envoyproxy.controlplane.server.V3DiscoveryServer;
@@ -40,6 +41,7 @@ public class XdsControlPlaneApplication {
     private final XdsConfigManager configManager;
     private final UserStore userStore;
     private final boolean requireAuthentication;
+    private final ObjectMapper jsonMapper;
     private com.sun.net.httpserver.HttpServer httpServer;
 
     private static void initializeNodeId() {
@@ -69,6 +71,7 @@ public class XdsControlPlaneApplication {
 
         // Check if authentication should be enabled (can be disabled via environment variable)
         this.requireAuthentication = !Boolean.parseBoolean(System.getenv().getOrDefault("DISABLE_AUTH", "false"));
+        this.jsonMapper = new ObjectMapper();
 
         logger.info("Authentication {}", requireAuthentication ? "enabled" : "disabled");
         logger.info("Using NODE_ID: {}", nodeId);
@@ -242,6 +245,146 @@ public class XdsControlPlaneApplication {
             }
         });
         endpointsContext.getFilters().add(new AuthenticationFilter(userStore, requireAuthentication));
+
+        // Add route endpoint (protected)
+        com.sun.net.httpserver.HttpContext routesContext = httpServer.createContext("/api/routes", exchange -> {
+            if ("POST".equals(exchange.getRequestMethod())) {
+                try {
+                    String username = exchange.getRequestHeaders().getFirst("X-User");
+                    logger.info("Add route requested by user: {}", username);
+
+                    String requestBody = new String(exchange.getRequestBody().readAllBytes());
+                    configManager.addRoute(requestBody);
+                    Snapshot snapshot = configManager.generateInitialSnapshot();
+                    cache.setSnapshot(nodeId, snapshot);
+
+                    String response = "{\"status\":\"ok\",\"message\":\"Route added\"}";
+                    byte[] responseBytes = response.getBytes();
+                    exchange.getResponseHeaders().set("Content-Type", "application/json");
+                    exchange.sendResponseHeaders(200, responseBytes.length);
+                    exchange.getResponseBody().write(responseBytes);
+                    exchange.getResponseBody().close();
+                } catch (Exception e) {
+                    logger.error("Failed to add route", e);
+                    String errorResponse = "{\"error\":\"Internal server error\"}";
+                    byte[] errorBytes = errorResponse.getBytes();
+                    exchange.getResponseHeaders().set("Content-Type", "application/json");
+                    exchange.sendResponseHeaders(500, errorBytes.length);
+                    exchange.getResponseBody().write(errorBytes);
+                    exchange.getResponseBody().close();
+                }
+            } else if ("GET".equals(exchange.getRequestMethod())) {
+                try {
+                    logger.info("List routes requested");
+
+                    String routesJson = configManager.listRoutes();
+                    byte[] responseBytes = routesJson.getBytes();
+                    exchange.getResponseHeaders().set("Content-Type", "application/json");
+                    exchange.sendResponseHeaders(200, responseBytes.length);
+                    exchange.getResponseBody().write(responseBytes);
+                    exchange.getResponseBody().close();
+                } catch (Exception e) {
+                    logger.error("Failed to list routes", e);
+                    String errorResponse = "{\"error\":\"Internal server error\"}";
+                    byte[] errorBytes = errorResponse.getBytes();
+                    exchange.getResponseHeaders().set("Content-Type", "application/json");
+                    exchange.sendResponseHeaders(500, errorBytes.length);
+                    exchange.getResponseBody().write(errorBytes);
+                    exchange.getResponseBody().close();
+                }
+            } else if ("DELETE".equals(exchange.getRequestMethod())) {
+                try {
+                    String username = exchange.getRequestHeaders().getFirst("X-User");
+                    logger.info("Delete route requested by user: {}", username);
+
+                    // Extract domain pattern from path
+                    String path = exchange.getRequestURI().getPath();
+                    String domainPattern = path.substring("/api/routes/".length());
+
+                    configManager.deleteRoute(domainPattern);
+                    Snapshot snapshot = configManager.generateInitialSnapshot();
+                    cache.setSnapshot(nodeId, snapshot);
+
+                    String response = "{\"status\":\"ok\",\"message\":\"Route deleted\"}";
+                    byte[] responseBytes = response.getBytes();
+                    exchange.getResponseHeaders().set("Content-Type", "application/json");
+                    exchange.sendResponseHeaders(200, responseBytes.length);
+                    exchange.getResponseBody().write(responseBytes);
+                    exchange.getResponseBody().close();
+                } catch (Exception e) {
+                    logger.error("Failed to delete route", e);
+                    String errorResponse = "{\"error\":\"Internal server error\"}";
+                    byte[] errorBytes = errorResponse.getBytes();
+                    exchange.getResponseHeaders().set("Content-Type", "application/json");
+                    exchange.sendResponseHeaders(500, errorBytes.length);
+                    exchange.getResponseBody().write(errorBytes);
+                    exchange.getResponseBody().close();
+                }
+            } else {
+                String errorResponse = "{\"error\":\"Method not allowed\"}";
+                byte[] errorBytes = errorResponse.getBytes();
+                exchange.getResponseHeaders().set("Content-Type", "application/json");
+                exchange.sendResponseHeaders(405, errorBytes.length);
+                exchange.getResponseBody().write(errorBytes);
+                exchange.getResponseBody().close();
+            }
+        });
+        routesContext.getFilters().add(new AuthenticationFilter(userStore, requireAuthentication));
+
+        // Add route template endpoint (protected)
+        com.sun.net.httpserver.HttpContext routeTemplateContext = httpServer.createContext("/api/routes/template/", exchange -> {
+            if ("POST".equals(exchange.getRequestMethod())) {
+                try {
+                    String username = exchange.getRequestHeaders().getFirst("X-User");
+                    logger.info("Add route from template requested by user: {}", username);
+
+                    // Extract template name from path
+                    String path = exchange.getRequestURI().getPath();
+                    String templateName = path.substring("/api/routes/template/".length());
+
+                    String requestBody = new String(exchange.getRequestBody().readAllBytes());
+                    String clusterOverride = null;
+
+                    if (!requestBody.isEmpty()) {
+                        try {
+                            com.fasterxml.jackson.databind.JsonNode jsonNode = jsonMapper.readTree(requestBody);
+                            if (jsonNode.has("cluster_override")) {
+                                clusterOverride = jsonNode.get("cluster_override").asText();
+                            }
+                        } catch (Exception e) {
+                            logger.warn("Failed to parse cluster override from request body", e);
+                        }
+                    }
+
+                    configManager.addRouteFromTemplate(templateName, clusterOverride);
+                    Snapshot snapshot = configManager.generateInitialSnapshot();
+                    cache.setSnapshot(nodeId, snapshot);
+
+                    String response = "{\"status\":\"ok\",\"message\":\"Route created from template\"}";
+                    byte[] responseBytes = response.getBytes();
+                    exchange.getResponseHeaders().set("Content-Type", "application/json");
+                    exchange.sendResponseHeaders(200, responseBytes.length);
+                    exchange.getResponseBody().write(responseBytes);
+                    exchange.getResponseBody().close();
+                } catch (Exception e) {
+                    logger.error("Failed to create route from template", e);
+                    String errorResponse = "{\"error\":\"Internal server error\"}";
+                    byte[] errorBytes = errorResponse.getBytes();
+                    exchange.getResponseHeaders().set("Content-Type", "application/json");
+                    exchange.sendResponseHeaders(500, errorBytes.length);
+                    exchange.getResponseBody().write(errorBytes);
+                    exchange.getResponseBody().close();
+                }
+            } else {
+                String errorResponse = "{\"error\":\"Method not allowed\"}";
+                byte[] errorBytes = errorResponse.getBytes();
+                exchange.getResponseHeaders().set("Content-Type", "application/json");
+                exchange.sendResponseHeaders(405, errorBytes.length);
+                exchange.getResponseBody().write(errorBytes);
+                exchange.getResponseBody().close();
+            }
+        });
+        routeTemplateContext.getFilters().add(new AuthenticationFilter(userStore, requireAuthentication));
 
         httpServer.setExecutor(executorService);
         httpServer.start();
